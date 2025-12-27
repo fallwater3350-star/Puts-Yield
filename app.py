@@ -30,11 +30,41 @@ def ann_by_margin(bid: float, strike: float, dte: int, margin_ratio: float) -> f
 def get_meta(ticker: str):
     t = yf.Ticker(ticker)
     exps = t.options or []
+
     spot = None
+
+    # 1) fast_info（快，但云端偶发为空）
     try:
-        spot = t.fast_info.get("last_price") if hasattr(t, "fast_info") else None
+        if hasattr(t, "fast_info") and t.fast_info:
+            spot = t.fast_info.get("last_price") or t.fast_info.get("lastPrice")
+    except Exception:
+        pass
+
+    # 2) info（慢一些，但有时更稳）
+    if spot is None:
+        try:
+            info = t.info  # 可能较慢
+            spot = info.get("regularMarketPrice") or info.get("currentPrice")
+        except Exception:
+            pass
+
+    # 3) history close（兜底最稳）
+    if spot is None:
+        try:
+            h = t.history(period="5d", interval="1d")
+            if h is not None and not h.empty:
+                spot = float(h["Close"].dropna().iloc[-1])
+        except Exception:
+            pass
+
+    # 清理/标准化
+    try:
+        spot = float(spot) if spot is not None else None
+        if spot is not None and (not math.isfinite(spot) or spot <= 0):
+            spot = None
     except Exception:
         spot = None
+
     return exps, spot
 
 @st.cache_data(ttl=180)
