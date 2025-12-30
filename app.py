@@ -12,6 +12,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Put 年化收益率查询器", layout="wide")
 
+
 # =========================
 # Math
 # =========================
@@ -21,17 +22,30 @@ def ann_by_strike(bid: float, strike: float, dte: int) -> float:
         return float("nan")
     return (bid / strike) * (365.0 / dte)
 
-def ann_by_margin(bid: float, strike: float, dte: int, margin_ratio: float) -> float:
+def calc_capital(strike: float, margin_ratio: float, ask: float, spot: float) -> float:
     """
-    Margin annualized return using capital = strike * margin_ratio
-    annualized = (bid / (strike*margin_ratio)) * 365/dte
+    Your estimated margin capital formula:
+      capital = K*margin_ratio + ask - 0.75*(spot - K)
     """
-    if margin_ratio <= 0:
+    if strike <= 0 or margin_ratio <= 0:
         return float("nan")
-    denom = strike * margin_ratio
-    if dte <= 0 or denom <= 0 or not math.isfinite(bid) or bid <= 0:
+    if not (math.isfinite(spot) and spot > 0):
         return float("nan")
-    return (bid / denom) * (365.0 / dte)
+    if not (math.isfinite(ask) and ask >= 0):
+        return float("nan")
+
+    capital = (strike * margin_ratio) + ask - 0.75 * (spot - strike)
+    if (not math.isfinite(capital)) or capital <= 0:
+        return float("nan")
+    return capital
+
+def ann_by_margin(bid: float, dte: int, capital: float) -> float:
+    """Margin annualized return: (bid/capital) * 365/dte"""
+    if dte <= 0 or not math.isfinite(bid) or bid <= 0:
+        return float("nan")
+    if not math.isfinite(capital) or capital <= 0:
+        return float("nan")
+    return (bid / capital) * (365.0 / dte)
 
 def exp_to_dte(exp: str, today: date) -> int:
     exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
@@ -44,34 +58,27 @@ def exp_to_dte(exp: str, today: date) -> int:
 def is_rate_limit_error(e: Exception) -> bool:
     name = type(e).__name__
     msg = str(e).lower()
-    # yfinance has YFRateLimitError; sometimes wrapped
     return ("ratelimit" in name.lower()) or ("rate limit" in msg) or ("too many requests" in msg)
 
 def with_retry(fn, *, retries: int = 3, base_sleep: float = 1.0):
-    """
-    Retry wrapper with exponential backoff + jitter.
-    Only retries for rate-limit-like errors; for other errors, it still retries once or twice
-    because yfinance can be flaky, but stops early if needed.
-    """
+    """Retry with exponential backoff + jitter."""
     last_err = None
     for i in range(retries):
         try:
             return fn()
         except Exception as e:
             last_err = e
-            # backoff: 1,2,4 + jitter
-            sleep_s = base_sleep * (2 ** i) + random.uniform(0, 0.3)
-            time.sleep(sleep_s)
+            time.sleep(base_sleep * (2 ** i) + random.uniform(0, 0.35))
     raise last_err
 
-@st.cache_data(ttl=1800)  # 30 minutes cache to reduce Yahoo hits on Streamlit Cloud
+@st.cache_data(ttl=1800)  # 30 min
 def fetch_expirations(ticker: str) -> List[str]:
     def _do():
         t = yf.Ticker(ticker)
         return t.options or []
     return with_retry(_do, retries=3, base_sleep=1.0)
 
-@st.cache_data(ttl=600)  # 10 minutes cache for spot
+@st.cache_data(ttl=600)  # 10 min
 def fetch_spot(ticker: str) -> Optional[float]:
     """
     Multi-fallback spot fetch:
@@ -93,7 +100,7 @@ def fetch_spot(ticker: str) -> Optional[float]:
         # 2) info
         if spot is None:
             try:
-                info = t.info  # slower, but sometimes more stable
+                info = t.info
                 spot = info.get("regularMarketPrice") or info.get("currentPrice")
             except Exception:
                 pass
@@ -119,7 +126,7 @@ def fetch_spot(ticker: str) -> Optional[float]:
 
     return with_retry(_do, retries=3, base_sleep=1.0)
 
-@st.cache_data(ttl=1800)  # 30 minutes cache per (ticker, exp)
+@st.cache_data(ttl=1800)  # 30 min per (ticker, exp)
 def fetch_put_chain(ticker: str, exp: str) -> pd.DataFrame:
     def _do():
         t = yf.Ticker(ticker)
@@ -138,14 +145,13 @@ st.title("PUT 期权年化收益率查询器（bid / K）")
 with st.sidebar:
     st.subheader("查询条件")
 
-    # Clear cache button
     if st.button("强制刷新数据（清缓存）"):
         st.cache_data.clear()
         st.session_state.pop("last_result", None)
         st.session_state.pop("last_meta", None)
         st.rerun()
 
-    # IMPORTANT: only collect inputs here, do NOT fetch yfinance here
+    # Only collect inputs here (no yfinance calls here)
     with st.form("filters"):
         ticker = st.text_input("股票代码 (Ticker)", value="QQQ").strip().upper()
 
@@ -196,13 +202,15 @@ with st.sidebar:
             step=1
         )
 
-        top_n = st.number_input("显示 Top N（按 margin 年化排序）", min_value=10, max_value=500, value=100, step=10)
+        top_n = st.number_input("显示 Top N（按 Margin 年化排序）", min_value=10, max_value=500, value=100, step=10)
 
         submitted = st.form_submit_button("查询/刷新")
 
+# If never queried, stop
 if not submitted and "last_result" not in st.session_state:
     st.info("在左侧设置条件后，点“查询/刷新”。")
     st.stop()
+
 
 # =========================
 # Run query (only on submit)
@@ -211,7 +219,6 @@ if submitted:
     today = date.today()
 
     try:
-        # fetch expirations (cached)
         exps = fetch_expirations(ticker)
     except Exception as e:
         if is_rate_limit_error(e):
@@ -224,7 +231,7 @@ if submitted:
         st.warning("未获取到到期日列表（可能数据源暂时不可用）。稍后重试。")
         st.stop()
 
-    # compute DTE and filter by range
+    # Build DTE-filtered expirations
     exp_candidates: List[Tuple[str, int]] = []
     for exp in exps:
         dte = exp_to_dte(exp, today)
@@ -235,32 +242,28 @@ if submitted:
         st.warning("没有找到落在该 DTE 区间内的到期日。请放宽 DTE 范围。")
         st.stop()
 
-    # limit number of expirations scanned to reduce rate-limit risk
-    exp_candidates.sort(key=lambda x: x[1])  # nearest first
+    # Limit scanning count to reduce rate-limit risk
+    exp_candidates.sort(key=lambda x: x[1])
     exp_candidates = exp_candidates[: int(max_exps_to_scan)]
 
-    # fetch spot (cached + fallback)
-    spot = None
+    # Spot (cached + fallback). If fails, OTM% mode will be degraded.
     try:
         spot = fetch_spot(ticker)
-    except Exception as e:
-        # spot failure should not kill the whole app unless user insists on OTM%
+    except Exception:
         spot = None
 
-    # if user chose OTM% mode but spot missing -> soft fail with guidance
     if strike_mode.startswith("按OTM") and not spot:
-        st.warning("当前无法获取 spot（可能限流/休市/数据源波动）。已建议：切换为“按K区间筛选”，或稍后重试。")
+        st.warning("当前无法获取 spot（可能限流/休市/数据源波动）。建议：切换为“按K区间筛选”，或稍后重试。")
 
-    # fetch option chains
     frames = []
     errors = 0
+
     with st.spinner("抓取期权链并计算中（云端可能需要几秒）..."):
         for exp, dte in exp_candidates:
             try:
                 puts = fetch_put_chain(ticker, exp)
             except Exception as e:
                 errors += 1
-                # If rate limited mid-way, stop early to avoid hammering
                 if is_rate_limit_error(e):
                     break
                 continue
@@ -276,6 +279,10 @@ if submitted:
             df["inTheMoney"] = df["inTheMoney"].astype(bool)
             df["dte"] = dte
             df["spot"] = spot
+
+            # Fill ask if missing (your formula uses ask; if missing, fallback to bid to avoid losing rows)
+            df["ask_filled"] = df["ask"]
+            df.loc[df["ask_filled"].isna(), "ask_filled"] = df.loc[df["ask_filled"].isna(), "bid"]
 
             # moneyness
             if spot and math.isfinite(float(spot)):
@@ -297,7 +304,7 @@ if submitted:
                 if strike_max > 0:
                     df = df[df["strike"] <= strike_max]
             else:
-                # OTM% requires spot; if missing, skip this mode’s filter (but keep data so user sees something)
+                # OTM% requires spot; if missing, skip this filter (still show results)
                 if spot and math.isfinite(float(spot)):
                     df = df[df["moneyness_pct"].notna()]
                     df = df[(df["moneyness_pct"] >= otm_low) & (df["moneyness_pct"] <= otm_high)]
@@ -305,12 +312,30 @@ if submitted:
             if df.empty:
                 continue
 
-            # annualized
+            # cash-secured annualized
             df["ann_return_pct"] = df.apply(
-                lambda r: ann_by_strike(float(r["bid"]), float(r["strike"]), int(r["dte"])) * 100, axis=1
+                lambda r: ann_by_strike(float(r["bid"]), float(r["strike"]), int(r["dte"])) * 100,
+                axis=1
             )
+
+            # capital + margin annualized (your formula)
+            df["capital"] = df.apply(
+                lambda r: calc_capital(
+                    strike=float(r["strike"]),
+                    margin_ratio=float(margin_ratio),
+                    ask=float(r["ask_filled"]) if pd.notna(r["ask_filled"]) else float("nan"),
+                    spot=float(r["spot"]) if pd.notna(r["spot"]) else float("nan"),
+                ),
+                axis=1
+            )
+
             df["ann_return_margin_pct"] = df.apply(
-                lambda r: ann_by_margin(float(r["bid"]), float(r["strike"]), int(r["dte"]), float(margin_ratio)) * 100, axis=1
+                lambda r: ann_by_margin(
+                    bid=float(r["bid"]),
+                    dte=int(r["dte"]),
+                    capital=float(r["capital"]) if pd.notna(r["capital"]) else float("nan"),
+                ) * 100,
+                axis=1
             )
 
             frames.append(df)
@@ -324,13 +349,13 @@ if submitted:
 
     result = pd.concat(frames, ignore_index=True)
 
-    # sort
+    # sort: margin annualized first, then cash annualized, then nearer expiry
     result = result.sort_values(
         ["ann_return_margin_pct", "ann_return_pct", "dte"],
         ascending=[False, False, True]
     ).reset_index(drop=True)
 
-    # store result in session_state so the page remains viewable without re-fetching
+    # save session result to avoid re-fetch on every rerun
     st.session_state["last_result"] = result
     st.session_state["last_meta"] = {
         "ticker": ticker,
@@ -343,11 +368,14 @@ if submitted:
         "otm_high": float(otm_high),
         "strike_min": float(strike_min),
         "strike_max": float(strike_max),
+        "max_exps_to_scan": int(max_exps_to_scan),
+        "top_n": int(top_n),
         "scanned_exps": [x[0] for x in exp_candidates],
     }
 
+
 # =========================
-# Display (use cached session result)
+# Display (from session_state)
 # =========================
 result = st.session_state.get("last_result")
 meta = st.session_state.get("last_meta", {})
@@ -356,10 +384,9 @@ if result is None or result.empty:
     st.warning("暂无结果。请在左侧点“查询/刷新”。")
     st.stop()
 
-# Summary cards
 spot_show = meta.get("spot", None)
-dte_min = meta.get("dte_min")
-dte_max = meta.get("dte_max")
+dte_min = meta.get("dte_min", 0)
+dte_max = meta.get("dte_max", 0)
 margin_ratio = meta.get("margin_ratio", 1.0)
 
 top_margin = float(result["ann_return_margin_pct"].iloc[0]) if len(result) else float("nan")
@@ -373,24 +400,25 @@ c4.metric("Top 年化（Margin）", f"{top_margin:.2f}%")
 
 st.caption(f"Top 年化（Cash-secured, bid/K）：{top_cash:.2f}% ｜ margin_ratio={margin_ratio:.2f}")
 
-# Show filters used
 with st.expander("本次查询参数（便于复查）", expanded=False):
     st.write(meta)
 
-# Table
 st.subheader(f"{meta.get('ticker','')} PUT 年化收益率结果（按 Margin 年化排序）")
 
 show_cols = [
     "contractSymbol", "exp", "dte",
-    "strike", "bid", "ask",
+    "spot", "strike",
+    "bid", "ask", "ask_filled",
+    "moneyness_pct", "openInterest", "inTheMoney",
+    "capital",
     "ann_return_pct", "ann_return_margin_pct",
-    "moneyness_pct", "openInterest", "inTheMoney", "spot"
 ]
 
-top_n = int(meta.get("top_n", 100)) if "top_n" in meta else 100
+top_n = int(meta.get("top_n", 100))
 view = result[show_cols].head(top_n)
 
-st.dataframe(view, use_container_width=True, height=580)
+# Friendly formatting: keep as numeric but show table
+st.dataframe(view, use_container_width=True, height=600)
 
 csv_bytes = view.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 st.download_button(
